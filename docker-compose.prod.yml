@@ -1,0 +1,38 @@
+name: primark-prod
+
+services:
+  web:
+    container_name: primark-web
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --root-path /primark
+    env_file: .env
+    network_mode: host
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    container_name: primark-redis
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    network_mode: host
+    restart: always
+
+  worker-product:
+    container_name: primark-worker-product
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m arq app.workers.product_worker.Settings
+    env_file: .env
+    network_mode: host
+    restart: always
+
+volumes:
+  redis_data:
