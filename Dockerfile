@@ -18,5 +18,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 COPY . .
 
+EXPOSE 8000
+
 # Entrypoint will be overridden by docker-compose commands
 CMD ["python", "main.py"]

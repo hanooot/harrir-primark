@@ -28,7 +28,7 @@ class DownloadImage:
     """
     Helper for uploading original product images to S3.
 
-    Copied from `primarkapi.py` so `primarkapi2.py` can upload images without Selenium.
+    Helper for uploading original product images to S3 without Selenium.
     """
 
     def __init__(self, task_id: str = "unknown"):

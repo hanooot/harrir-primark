@@ -8,14 +8,18 @@ import os
 import json
 from typing import Any, Dict, List
 
-from arq import create_pool
+from datetime import datetime
+
+from arq import create_pool, cron
 from arq.connections import RedisSettings
 from dotenv import load_dotenv
 
 from app.config import set_environment
+from app.core.task_primark import update_primark_prices
 from app.utils.color_utils import get_color_hexes_from_variants
 from app.utils.image_processing import DownloadImage
 from app.utils.primark_utils import post_product_to_api, append_log, complete_task
+from app.workers.price_updater_worker import update_job_stats, is_previous_run_active
 
 load_dotenv()
 
@@ -314,9 +318,102 @@ async def finalize_task(
         complete_task(task_id, final_status)
 
 
+async def scheduled_price_update(ctx):
+    """Cron-triggered Primark price/stock update. Fires every 12 hours.
+    Publishes progress/status to Redis so /price-updater/status and /history see it."""
+    job_id = ctx.get("job_id", "unknown")
+    redis_pool = ctx.get("redis")
+    task_id = f"scheduled-price-{job_id[:8]}"
+    start_time = datetime.utcnow()
+
+    active, prev_job_id = await is_previous_run_active(redis_pool, job_id)
+    if active:
+        logger.warning(
+            f"[cron] Previous Primark price-update run {prev_job_id} still active; skipping this fire"
+        )
+        return {"status": "skipped", "reason": "previous_run_in_progress", "previous_job_id": prev_job_id}
+
+    logger.info(f"[cron] Starting Primark price update (task_id={task_id})")
+    await update_job_stats(
+        redis_pool, job_id, "running",
+        start_time=start_time.isoformat(),
+        task_id=task_id,
+    )
+
+    async def on_progress(progress: dict):
+        await update_job_stats(
+            redis_pool, job_id, "running",
+            start_time=start_time.isoformat(),
+            task_id=task_id,
+            total_records=progress.get("total_records"),
+            updated=progress.get("updated"),
+            skipped=progress.get("skipped"),
+            variants_completed=progress.get("variants_completed"),
+        )
+
+    try:
+        result = await update_primark_prices(
+            task_id=task_id,
+            batch_size=100,
+            concurrency=5,
+            on_progress=on_progress,
+        )
+
+        if job_id.startswith("cron:"):
+            from app.core.task_primark import _PRICE_ALERTS
+            from app.utils.price_alerts import post_price_drops
+            if _PRICE_ALERTS:
+                alerts_snapshot = dict(_PRICE_ALERTS)
+                _PRICE_ALERTS.clear()
+                try:
+                    summary = await post_price_drops(alerts_snapshot)
+                    logger.info(f"[cron] Primark price-drops posted: {summary}")
+                except Exception as exc:
+                    logger.error(f"[cron] Primark price-drops post failed: {exc}", exc_info=True)
+
+        end_time = datetime.utcnow()
+        duration = (end_time - start_time).total_seconds()
+        final_stats = {
+            "start_time": start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+            "duration_seconds": duration,
+            "task_id": task_id,
+        }
+        if result:
+            final_stats["total_records"] = result.get("total_records")
+            final_stats["updated"] = result.get("updated")
+            final_stats["skipped"] = result.get("skipped")
+            final_stats["variants_completed"] = result.get("variants_completed")
+        await update_job_stats(redis_pool, job_id, "completed", **final_stats)
+
+        logger.info(f"[cron] Primark price update complete in {duration:.1f}s: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"[cron] Primark price update failed: {e}", exc_info=True)
+        await update_job_stats(
+            redis_pool, job_id, "failed",
+            error=str(e),
+            start_time=start_time.isoformat(),
+            end_time=datetime.utcnow().isoformat(),
+            task_id=task_id,
+        )
+        raise
+
+
 class Settings:
     redis_settings = RedisSettings(host=REDIS_HOST, port=REDIS_PORT)
     queue_name = "arq:product"
-    functions = [process_full_product, finalize_task]
+    functions = [process_full_product, finalize_task, scheduled_price_update]
+    cron_jobs = [
+        cron(
+            scheduled_price_update,
+            hour={0, 12},
+            minute=0,
+            run_at_startup=False,
+            max_tries=1,
+            timeout=86400,  # 24h — effectively no timeout; run until all variants processed
+        ),
+    ]
     job_timeout = 1800  # sentinel may wait a long time for all products
     max_jobs = 10
+    allow_abort_jobs = True

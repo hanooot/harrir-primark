@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import random
 import requests
 import time
 import math
@@ -9,6 +11,8 @@ import threading
 from typing import Optional, Dict, Any, List
 from collections import defaultdict
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+
+import httpx
 
 def remove_utm_source(url: str) -> str:
     """Removes all utm_ parameters from URL."""
@@ -22,9 +26,67 @@ def remove_utm_source(url: str) -> str:
 
 from rnet import Client, Impersonate
 
-RNET_CLIENT = Client(impersonate=Impersonate.Chrome128)
-
 logger = logging.getLogger(__name__)
+
+
+def _create_rnet_client() -> Client:
+    """Build a fresh rnet client — starts a new TCP+TLS+HTTP/2 session with a reset stream-ID counter."""
+    return Client(impersonate=Impersonate.Chrome128)
+
+
+# Rotate the underlying rnet client after this many requests. Akamai-fronted edges reset
+# HTTP/2 streams with INTERNAL_ERROR once a single connection has served too many streams; forcing
+# a fresh handshake avoids the server-side reset wave that drops variants.
+CLIENT_MAX_REQUESTS = 500
+
+# Substrings that indicate the underlying connection is poisoned and must be rebuilt before retry.
+_CONNECTION_POISON_PATTERNS = (
+    "Reset",
+    "INTERNAL_ERROR",
+    "GOAWAY",
+    "BrokenPipe",
+    "connection closed",
+    "stream closed",
+    "TimedOut",
+    "timeout",
+)
+
+
+class ScraperClient:
+    """rnet.Client wrapper that rotates itself after N requests or on poisoned-connection errors."""
+
+    def __init__(self, max_requests: int = CLIENT_MAX_REQUESTS, name: str = ""):
+        self._client = _create_rnet_client()
+        self._count = 0
+        self._max = max_requests
+        self._name = name or "default"
+
+    def _rotate(self, reason: str) -> None:
+        prev = self._count
+        self._client = _create_rnet_client()
+        self._count = 0
+        logger.info(f"[ScraperClient:{self._name}] rotated after {prev} reqs (reason: {reason})")
+
+    async def get(self, url: str, **kwargs):
+        if self._count >= self._max:
+            self._rotate("request-count threshold")
+        self._count += 1
+        return await self._client.get(url, **kwargs)
+
+    def handle_exception(self, exc: BaseException) -> bool:
+        """Rotate the client if the exception looks like a poisoned HTTP/2 connection. Returns True if rotated."""
+        msg = repr(exc)
+        if any(p in msg for p in _CONNECTION_POISON_PATTERNS):
+            self._rotate(f"connection poisoned ({type(exc).__name__})")
+            return True
+        return False
+
+    def rotate_on_server_throttle(self, status: int) -> None:
+        """Rotate when the server returned a throttling/unavailable status — reuses the same connection are likely to get the same treatment."""
+        self._rotate(f"server throttle HTTP {status}")
+
+
+RNET_CLIENT: ScraperClient = ScraperClient(name="global")
 
 from app.utils.primark_utils import (
     append_log,
@@ -398,25 +460,33 @@ def group_variants_by_url(variants: List[Dict[str, Any]]) -> Dict[str, List[Dict
     return dict(url_groups)
 
 
-async def scrape_product_data(url: str, timeout: int = 15) -> Optional[Dict[str, Any]]:
+async def scrape_product_data(
+    url: str,
+    timeout: int = 15,
+    client: Optional[ScraperClient] = None,
+) -> Optional[Dict[str, Any]]:
     """
     Scrape product page once and extract all data using rnet (no fallback).
     Returns: {original_price, discounted_price, discount_percentage, size_stock, color_links}
     """
     url = remove_utm_source(url)
-    if RNET_CLIENT is None:
-        logger.error("RNET_CLIENT not initialized; cannot scrape.")
+    http_client = client if client is not None else RNET_CLIENT
+    if http_client is None:
+        logger.error("No scraper client available; cannot scrape.")
         return None
 
     try:
-        # Use rnet client to fetch HTML directly without a separate sync thread
-        resp = await RNET_CLIENT.get(url, headers=PRIMARK_REQUEST_HEADERS, timeout=timeout)
+        resp = await http_client.get(url, headers=PRIMARK_REQUEST_HEADERS, timeout=timeout)
         status = int(resp.status) if hasattr(resp.status, "__int__") else resp.status
+        status_int = int(status) if not isinstance(status, int) else status
         if str(status).startswith("404"):
             logger.warning(f"rnet fetch failed with status 404 for {url}. Returning 404 marker.")
             return {"rnet_status_404": True}
         if not str(status).startswith("200"):
             logger.warning(f"rnet fetch failed with status {status} for {url}")
+            # 429/5xx indicate the edge is throttling this connection — rotate so the retry doesn't reuse it.
+            if status_int in (429, 502, 503, 504):
+                http_client.rotate_on_server_throttle(status_int)
             return None
 
         text = await resp.text()
@@ -447,7 +517,66 @@ async def scrape_product_data(url: str, timeout: int = 15) -> Optional[Dict[str,
         }
     except Exception as e:
         logger.error(f"Error scraping {url} with rnet: {e}")
+        http_client.handle_exception(e)
         return None
+
+
+_EMBED_SERVICE_TASKS: set[asyncio.Task] = set()
+_PARENT_ASINS_TO_EMBED: set[str] = set()
+
+# Collector for post-cron price-drop alerts. {ASIN: {"old_price": str, "new_price": str}}.
+# Populated on `hanooot_price` change; flushed in product_worker.scheduled_price_update.
+_PRICE_ALERTS: Dict[str, Dict[str, str]] = {}
+_EMBED_CONCURRENCY: asyncio.Semaphore = asyncio.Semaphore(50)
+
+
+def _derive_parent_asin(variant_asin: str) -> str:
+    """Strip trailing -{idx} from a variant ASIN.
+    e.g., PRM-3009778053-1 → PRM-3009778053."""
+    if not variant_asin:
+        return variant_asin
+    parts = variant_asin.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0]
+    return variant_asin
+
+
+async def _call_embed_service(product: dict):
+    asin = product.get("ASIN") or product.get("asin")
+    async with _EMBED_CONCURRENCY:
+        logger.info(f"_call_embed_service started (asin={asin})")
+        try:
+            url = os.getenv("PRODUCT_UPDATE_URL")
+            if not url:
+                logger.warning("PRODUCT_UPDATE_URL not set in environment")
+                return
+
+            logger.info(f"Calling embed service url={url} asin={asin}")
+            timeout = httpx.Timeout(connect=5.0, read=2.0, write=5.0, pool=5.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                try:
+                    response = await client.patch(
+                        url,
+                        headers={
+                            "accept": "application/json",
+                            "Content-Type": "application/json",
+                        },
+                        json={"asin": asin},
+                    )
+                    logger.info(
+                        f"Embed service responded status={response.status_code} asin={asin}"
+                    )
+                except httpx.ReadTimeout:
+                    logger.info(f"Embed service fire-and-forget dispatched (no response) asin={asin}")
+        except Exception as e:
+            logger.warning(f"Embed service dispatch error asin={asin}: {e}")
+
+
+def _dispatch_embed_service(product: dict) -> None:
+    """Fire-and-forget dispatch of embed service call; keeps task reference to avoid GC."""
+    task = asyncio.create_task(_call_embed_service(product))
+    _EMBED_SERVICE_TASKS.add(task)
+    task.add_done_callback(_EMBED_SERVICE_TASKS.discard)
 
 
 def find_stock_for_size(size_stock_list: List[Dict], size: str) -> Dict[str, Any]:
@@ -580,6 +709,7 @@ async def apply_scraped_to_variants(
     start_index: int,
     usd_to_aed: float = USD_TO_AED,
     usd_to_iqd: float = USD_TO_IQD,
+    client: Optional[ScraperClient] = None,
 ) -> tuple[int, int]:
     """
     Apply already-scraped data to variants and send PATCH requests.
@@ -647,7 +777,7 @@ async def apply_scraped_to_variants(
 
                     if clean_url not in scraped_cache:
                         append_log(task_id, f"[{idx}] Scraping color URL: {correct_url}", "debug")
-                        cs = await scrape_product_data(correct_url)
+                        cs = await scrape_product_data(correct_url, client=client)
                         scraped_cache[clean_url] = cs if (cs and not cs.get("rnet_status_404")) else None
 
                     cdata = scraped_cache.get(clean_url) or scraped_data
@@ -657,6 +787,7 @@ async def apply_scraped_to_variants(
                     u, s = await apply_scraped_to_variants(
                         correct_url, cvariants, cdata_single,
                         task_id, idx, usd_to_aed=usd_to_aed, usd_to_iqd=usd_to_iqd,
+                        client=client,
                     )
                     total_updated += u
                     total_skipped += s
@@ -719,6 +850,17 @@ async def apply_scraped_to_variants(
             logger.info(f"[{task_id}] SKIPPED {asin}")
             append_log(task_id, f"[{idx}] ⏭️  {asin} | {variant_color}/{variant_size} | No changes, skipped", "debug")
             continue
+
+        parent_asin = _derive_parent_asin(asin)
+        if parent_asin:
+            _PARENT_ASINS_TO_EMBED.add(parent_asin)
+        old_hanoot = float(variant.get("price", {}).get("hanooot_price", 0) or 0)
+        new_hanoot = float(price_block.get("hanooot_price", 0) or 0)
+        if old_hanoot != new_hanoot:
+            _PRICE_ALERTS[asin] = {
+                "old_price": str(int(old_hanoot)),
+                "new_price": str(int(new_hanoot)),
+            }
 
         patch_payload = {
             "data": {

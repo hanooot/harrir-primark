@@ -53,6 +53,37 @@ async def update_job_stats(redis_pool, job_id: str, status: str, **kwargs):
         await conn.set(key, str(stats), ex=STATS_TTL_SECONDS)
 
 
+async def is_previous_run_active(redis_pool, own_job_id: str, max_staleness_seconds: int = 1800):
+    """Return (is_active, prev_job_id) if another price-update run is still actively
+    updating its stats (heartbeat within max_staleness_seconds)."""
+    import ast
+    async with redis_pool.client() as conn:
+        prev_raw = await conn.get(CURRENT_JOB_KEY)
+        if not prev_raw:
+            return False, None
+        prev_job_id = prev_raw.decode()
+        if prev_job_id == own_job_id:
+            return False, None
+        stats_raw = await conn.get(_job_stats_key(prev_job_id))
+        if not stats_raw:
+            return False, prev_job_id
+        try:
+            prev_stats = ast.literal_eval(stats_raw.decode())
+        except Exception:
+            return False, prev_job_id
+        if prev_stats.get("status") != "running":
+            return False, prev_job_id
+        ts_str = prev_stats.get("timestamp")
+        if not ts_str:
+            return False, prev_job_id
+        try:
+            last_update = datetime.fromisoformat(ts_str)
+        except ValueError:
+            return False, prev_job_id
+        age = (datetime.utcnow() - last_update).total_seconds()
+        return age < max_staleness_seconds, prev_job_id
+
+
 async def continuous_price_update_task(ctx, **kwargs) -> dict:
     """
     Main ARQ task for continuous price/stock updates.
