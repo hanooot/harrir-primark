@@ -737,6 +737,55 @@ def run_scraper(
     return asyncio.run(_async_run())
 
 
+# ============================================================
+#  Stubs kept for compatibility with task_primark.py (price-update path).
+#  The Primark refresh flow can re-use the GraphQL extractor above; these
+#  stubs only exist so module imports succeed.
+# ============================================================
+def _parse_price_number(s):
+    """Extract a numeric price from strings like 'AED 199' or '199.00'."""
+    if s is None:
+        return 0.0
+    if isinstance(s, (int, float)):
+        return float(s)
+    import re as _re
+    txt = str(s).replace(",", "")
+    m = _re.findall(r"\d+(?:\.\d+)?", txt)
+    if not m:
+        return 0.0
+    try:
+        return float(m[0])
+    except Exception:
+        return 0.0
+
+
+def _url_to_arabic(url: str) -> str:
+    """No-op for Primark (single-locale store). Kept for namshi-parity API."""
+    return url or ""
+
+
+def _parse_product_page_arabic_only_sync(html_content: str) -> dict:
+    """Primark serves a single locale; Arabic re-fetch is a no-op."""
+    return {"name_ar": "", "description_ar": "", "brand_ar": "", "specifications_ar": {}, "color_ar": ""}
+
+
+class PrimarkScraper:
+    """Stub kept so task_primark.py / primark_scraper_browser.py can import it.
+    The actual Primark extractor uses GraphQL via scrape_by_style/run_scraper above."""
+
+    @staticmethod
+    def _parse_product_page_sync(html_content: str, url: str | None = None) -> dict:
+        """No-op parser — returns the empty shape callers expect."""
+        return {
+            "variant_sku": "",
+            "original_price_text": "",
+            "selling_price_text": "",
+            "discount_percentage_text": "",
+            "size_stock": [],
+            "color_links": [],
+        }
+
+
 if __name__ == "__main__":
     import uuid
     run_scraper(

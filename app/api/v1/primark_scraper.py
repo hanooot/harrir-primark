@@ -8,7 +8,6 @@ from pydantic.config import ConfigDict
 from app.config import set_environment
 from app.utils.primark_utils import append_log, complete_task
 from app.core.primark_scraper_api import run_scraper as run_scraper_api
-from app.core.primark_scraper_browser import run_scraper as run_scraper_browser
 from app.core.task_primark import run_update_primark_prices
 import requests
 
@@ -60,8 +59,7 @@ def _scraper_worker(
     # Set context once for this thread — all downstream code reads it automatically
     set_environment(environment)
     try:
-        run_fn = run_scraper_browser if method.lower() == "browser" else run_scraper_api
-        run_fn(
+        run_scraper_api(
             target_url=url,
             task_id=task_id,
             sku=sku,
@@ -117,7 +115,7 @@ async def start_scraping_task(request: ScrapeRequest):
     if request.task_id in TASKS and TASKS[request.task_id]["status"] == "running":
         raise HTTPException(status_code=409, detail="Task already running with this task_id.")
 
-    if request.method.lower() not in ["api", "browser"]:
+    if request.method.lower() not in ["api"]:
         raise HTTPException(status_code=400, detail="Method must be 'api' or 'browser'.")
 
     stop_event = threading.Event()

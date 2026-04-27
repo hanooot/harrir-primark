@@ -10,7 +10,7 @@ services:
     volumes:
       - .:/app
     ports:
-      - "8000:8000"
+      - "8004:8000"
     env_file: .env
     environment:
       - REDIS_HOST=redis
@@ -21,8 +21,6 @@ services:
   redis:
     container_name: primark-redis-local
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
 
   worker:
     container_name: primark-worker-local
