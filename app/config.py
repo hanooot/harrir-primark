@@ -54,12 +54,17 @@ class EnvConfig:
     GEMINI_KEYS: str
     AUTOMATION_BACKEND_URL: str
     API_KEY: str
+    MONGO_URI: str
+    MONGO_DB_NAME: str
+    MONGO_PRODUCTS_COLLECTION: str
 
 
 _SHARED = dict(
     GEMINI_KEYS=os.getenv("GEMINI_KEYS", ""),
     AUTOMATION_BACKEND_URL=os.getenv("AUTOMATION_BACKEND_URL", ""),
     API_KEY=os.getenv("API_KEY", ""),
+    MONGO_DB_NAME=os.getenv("MONGO_DB_NAME", "Primary"),
+    MONGO_PRODUCTS_COLLECTION=os.getenv("MONGO_PRODUCTS_COLLECTION", "Products"),
 )
 
 _CONFIGS = {
@@ -70,6 +75,7 @@ _CONFIGS = {
         AWS_SECRET_ACCESS_KEY=os.getenv("AWS_SECRET_ACCESS_KEY_STAGE", ""),
         AWS_STORAGE_BUCKET_NAME=os.getenv("AWS_STORAGE_BUCKET_NAME_STAGE", ""),
         AWS_REGION=os.getenv("AWS_REGION_STAGE", ""),
+        MONGO_URI=os.getenv("MONGO_URI_STAGE", os.getenv("MONGO_URI", "")),
         **_SHARED,
     ),
     "prod": EnvConfig(
@@ -79,6 +85,7 @@ _CONFIGS = {
         AWS_SECRET_ACCESS_KEY=os.getenv("AWS_SECRET_ACCESS_KEY_PROD", ""),
         AWS_STORAGE_BUCKET_NAME=os.getenv("AWS_STORAGE_BUCKET_NAME_PROD", ""),
         AWS_REGION=os.getenv("AWS_REGION_PROD", ""),
+        MONGO_URI=os.getenv("MONGO_URI_PROD", os.getenv("MONGO_URI", "")),
         **_SHARED,
     ),
 }

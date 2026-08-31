@@ -1032,25 +1032,63 @@ async def _fetcher_into_queue(
     stop_event: Optional[threading.Event] = None,
     total_records_ref: Optional[List[Optional[int]]] = None,
 ) -> int:
-    """Fetch variants in batches, group by URL, put (url, variants, start_index) into scrape_queue."""
-    search_url = get_product_searching_url()
-    if not search_url:
-        append_log(task_id, "ERROR: Product search URL not configured", "critical")
+    """Fetch variants directly from MongoDB in ASIN-ordered batches, group by URL,
+    put (url, variants, start_index) into scrape_queue.
+
+    Reads product docs straight from Mongo and explodes their embedded `variants`
+    arrays into flat variant records (the shape the pipeline expects), instead of
+    the HTTP `/api/v1/products/search` API — that endpoint returns 0 records for
+    every query."""
+    if total_records_ref is None:
+        total_records_ref = [None]
+
+    from app.utils.mongo import get_products_collection_safe
+
+    mongo_filter = _build_filter_criteria(filter_task_id, filter_sku)
+    if "source_type" not in mongo_filter:
+        mongo_filter["source_type"] = "PRIMARK"
+
+    try:
+        col = await get_products_collection_safe()
+    except Exception as e:
+        logger.error(f"[{task_id}] Fetcher: Mongo connection failed: {e}")
+        append_log(task_id, f"Fetcher: Mongo connection failed: {e}", "critical")
         for _ in range(concurrency):
             await scrape_queue.put(None)
         return 0
 
-    if total_records_ref is None:
-        total_records_ref = [None]
+    if total_records_ref[0] is None:
+        try:
+            total_records_ref[0] = await col.count_documents(mongo_filter)
+        except Exception as e:
+            logger.warning(f"[{task_id}] Fetcher: count_documents failed: {e}")
 
-    filter_criteria = _build_filter_criteria(filter_task_id, filter_sku)
-
-    def _fetch_batch_sync(last_seen_asin: Optional[str]):
-        payload = _build_fetch_payload(filter_criteria, last_seen_asin, batch_size)
-        response = requests.post(search_url, json=payload, timeout=60)
-        response.raise_for_status()
-        data = response.json().get("data", {})
-        return data.get("records", []), data.get("total_records"), data.get("lastSeenASIN"), data.get("hasMore", False)
+    async def _fetch_batch(last_seen_asin: Optional[str]):
+        """Read one ASIN-ordered page of product docs from MongoDB and explode
+        their embedded `variants` arrays into flat variant records. Skips ahead
+        until at least one variant is found so an all-empty product page can't
+        end the run early.
+        Returns (variant_records, total_records, lastSeenASIN, hasMore)."""
+        records: List[Dict[str, Any]] = []
+        cursor_asin = last_seen_asin
+        has_more = True
+        while not records and has_more:
+            batch_filter = dict(mongo_filter)
+            if cursor_asin:
+                batch_filter["ASIN"] = {"$gt": cursor_asin}
+            docs = await col.find(
+                batch_filter, {"ASIN": 1, "variants": 1, "_id": 0}
+            ).sort("ASIN", 1).limit(batch_size).to_list(length=batch_size)
+            if not docs:
+                has_more = False
+                break
+            for doc in docs:
+                for v in doc.get("variants") or []:
+                    if isinstance(v, dict) and v.get("ASIN"):
+                        records.append(v)
+            cursor_asin = docs[-1].get("ASIN")
+            has_more = len(docs) == batch_size
+        return records, total_records_ref[0], cursor_asin, has_more
 
     MAX_FETCH_RETRIES = 3
     FETCH_RETRY_DELAY = 5
@@ -1072,7 +1110,7 @@ async def _fetcher_into_queue(
 
         for attempt in range(1, MAX_FETCH_RETRIES + 1):
             try:
-                variants, total_records, retrieved_last_seen_asin, has_more = await asyncio.to_thread(_fetch_batch_sync, last_seen_asin)
+                variants, total_records, retrieved_last_seen_asin, has_more = await _fetch_batch(last_seen_asin)
                 consecutive_failures = 0
                 break
             except Exception as e:
