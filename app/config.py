@@ -54,6 +54,8 @@ class EnvConfig:
     GEMINI_KEYS: str
     AUTOMATION_BACKEND_URL: str
     API_KEY: str
+    COMMISSION_API_EMAIL: str
+    COMMISSION_API_PASSWORD: str
     MONGO_URI: str
     MONGO_DB_NAME: str
     MONGO_PRODUCTS_COLLECTION: str
@@ -63,6 +65,8 @@ _SHARED = dict(
     GEMINI_KEYS=os.getenv("GEMINI_KEYS", ""),
     AUTOMATION_BACKEND_URL=os.getenv("AUTOMATION_BACKEND_URL", ""),
     API_KEY=os.getenv("API_KEY", ""),
+    COMMISSION_API_EMAIL=os.getenv("COMMISSION_API_EMAIL", ""),
+    COMMISSION_API_PASSWORD=os.getenv("COMMISSION_API_PASSWORD", ""),
     MONGO_DB_NAME=os.getenv("MONGO_DB_NAME", "Primary"),
     MONGO_PRODUCTS_COLLECTION=os.getenv("MONGO_PRODUCTS_COLLECTION", "Products"),
 )

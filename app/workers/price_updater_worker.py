@@ -12,6 +12,7 @@ from arq import create_pool
 from arq.connections import RedisSettings
 from dotenv import load_dotenv
 
+from app.core.pricing_config import fetch_pricing_config
 from app.core.task_primark import update_primark_prices
 
 load_dotenv()
@@ -125,6 +126,12 @@ async def continuous_price_update_task(ctx, **kwargs) -> dict:
     )
     
     try:
+        # Fetch the pricing config (categories/tiers/shipping constants) ONCE
+        # per cycle and reuse the same snapshot for every variant. Failure here
+        # falls through to the outer except, which logs/marks failed and
+        # re-enqueues — better than running with stale hardcoded constants.
+        pricing_config = await fetch_pricing_config()
+
         async def on_progress(progress: dict):
             await update_job_stats(
                 redis_pool, job_id, "running",
@@ -146,6 +153,7 @@ async def continuous_price_update_task(ctx, **kwargs) -> dict:
             concurrency=concurrency,
             stop_event=None,
             on_progress=on_progress,
+            pricing_config=pricing_config,
         )
         
         # Calculate duration

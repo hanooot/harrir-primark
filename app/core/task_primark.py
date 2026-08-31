@@ -98,11 +98,13 @@ from app.core.primark_scraper_api import (
     PrimarkScraper,
     _parse_price_number,
 )
-
-# Shipping Constants
-SEA_USD_PER_CBM = 100.0
-AIR_USD_PER_KG = 5.0
-MIN_AIR_USD = 1.0
+from app.core.pricing_config import (
+    PricingConfig,
+    fetch_pricing_config,
+    calculate_commission,
+    calculate_shipping_air,
+    calculate_shipping_sea,
+)
 
 USD_TO_IQD = 1500.0
 USD_TO_AED = 3.67
@@ -129,322 +131,6 @@ FETCH_PROJECTION = {
     "availability.status": 1,
     "availability.quantity": 1,
 }
-
-# Category weight/volume data
-CATEGORY_DATA = {
-    "Co-ords": {
-        "default": {"weight": 0.90, "cbm": 0.012},
-        "subcategories": {
-            "Two-piece Outfits": {"weight": 0.80, "cbm": 0.012},
-            "Pant Sets": {"weight": 0.90, "cbm": 0.012},
-        }
-    },
-
-    "Outerwear": {
-        "default": {"weight": 0.80, "cbm": 0.010},
-        "subcategories": {
-            "Jackets": {"weight": 0.80, "cbm": 0.010},
-            "Lightweight Jackets": {"weight": 0.65, "cbm": 0.010},
-            "Coats": {"weight": 1.00, "cbm": 0.010},
-            "Winter Coats": {"weight": 1.30, "cbm": 0.010},
-            "Overcoats": {"weight": 1.40, "cbm": 0.010},
-            "Faux Fur Coats": {"weight": 1.50, "cbm": 0.010},
-            "Trench Coats": {"weight": 1.10, "cbm": 0.010},
-            "Down Coats": {"weight": 1.60, "cbm": 0.010},
-        }
-    },
-
-    "Hoodies & Sweatshirt": {
-        "default": {"weight": 0.90, "cbm": 0.012},
-        "subcategories": {
-            "Hoodies": {"weight": 0.80, "cbm": 0.012},
-            "Sweatshirts": {"weight": 0.70, "cbm": 0.012},
-        }
-    },
-
-    "Tops": {
-        "default": {"weight": 0.50, "cbm": 0.005},
-        "subcategories": {
-            "T-shirts": {"weight": 0.45, "cbm": 0.005},
-            "Blouses": {"weight": 0.55, "cbm": 0.005},
-            "Tank Tops & Camis": {"weight": 0.40, "cbm": 0.005},
-            "Other Tops": {"weight": 0.55, "cbm": 0.005},
-            "Customized Women Tops": {"weight": 0.60, "cbm": 0.005},
-        }
-    },
-
-    "Knitwear": {
-        "default": {"weight": 0.60, "cbm": 0.006},
-        "subcategories": {
-            "Sweaters": {"weight": 0.75, "cbm": 0.006},
-            "Cardigans": {"weight": 0.70, "cbm": 0.006},
-            "Lightweight Cardigans": {"weight": 0.55, "cbm": 0.006},
-            "Knit Tops": {"weight": 0.55, "cbm": 0.006},
-            "Sweater Vests": {"weight": 0.60, "cbm": 0.006},
-            "Sweater Dresses": {"weight": 0.90, "cbm": 0.006},
-            "Sweater Skirts": {"weight": 0.65, "cbm": 0.006},
-            "Sweater Co-ords": {"weight": 1.00, "cbm": 0.006},
-        }
-    },
-
-    "Bottoms": {
-        "default": {"weight": 0.60, "cbm": 0.006},
-        "subcategories": {
-            "Pants": {"weight": 0.65, "cbm": 0.006},
-            "Skirts": {"weight": 0.55, "cbm": 0.006},
-            "Shorts": {"weight": 0.45, "cbm": 0.006},
-            "Denim Shorts": {"weight": 0.65, "cbm": 0.006},
-            "Sweatpants": {"weight": 0.75, "cbm": 0.006},
-            "Leggings": {"weight": 0.45, "cbm": 0.006},
-        }
-    },
-
-    "Jumpsuits & Bodysuits": {
-        "default": {"weight": 0.70, "cbm": 0.008},
-        "subcategories": {
-            "Jumpsuits": {"weight": 0.75, "cbm": 0.008},
-            "Body Suits": {"weight": 0.45, "cbm": 0.008},
-            "Unitards": {"weight": 0.55, "cbm": 0.008},
-        }
-    },
-
-    "Denim": {
-        "default": {"weight": 0.80, "cbm": 0.007},
-        "subcategories": {
-            "Jeans": {"weight": 0.85, "cbm": 0.007},
-            "Denim Shorts": {"weight": 0.65, "cbm": 0.007},
-            "Denim Skirts": {"weight": 0.70, "cbm": 0.007},
-            "Denim Dresses": {"weight": 0.90, "cbm": 0.007},
-            "Denim Overalls & Jumpsuits": {"weight": 1.10, "cbm": 0.007},
-            "Denim Jackets & Coats": {"weight": 1.20, "cbm": 0.007},
-            "Denim Tops": {"weight": 0.65, "cbm": 0.007},
-            "Denim Two-piece Outfits": {"weight": 1.20, "cbm": 0.007},
-        }
-    },
-
-    "Wedding": {
-        "default": {"weight": 1.50, "cbm": 0.050},
-        "subcategories": {
-            "Wedding Dresses": {"weight": 2.00, "cbm": 0.050},
-            "Bridesmaid Dresses": {"weight": 1.40, "cbm": 0.050},
-            "Wedding Guest Dresses": {"weight": 1.10, "cbm": 0.050},
-            "Bridal Shower Dresses": {"weight": 1.00, "cbm": 0.050},
-            "Mother of the Bride Dresses": {"weight": 1.60, "cbm": 0.050},
-            "Engagement Dresses": {"weight": 1.25, "cbm": 0.050},
-            "Ballgown Wedding Dresses": {"weight": 2.20, "cbm": 0.050},
-            "Bachelorette Party Dresses": {"weight": 0.95, "cbm": 0.050},
-        }
-    },
-
-    "Dresses": {
-        "default": {"weight": 0.60, "cbm": 0.006},
-        "subcategories": {
-            "Mini Dresses": {"weight": 0.65, "cbm": 0.006},
-            "Short Dresses": {"weight": 0.75, "cbm": 0.006},
-            "Midi Dresses": {"weight": 0.85, "cbm": 0.006},
-            "Long Dresses": {"weight": 0.95, "cbm": 0.006},
-            "Maxi Dresses": {"weight": 1.00, "cbm": 0.006},
-        }
-    },
-
-    "Suits": {
-        "default": {"weight": 1.10, "cbm": 0.018},
-        "subcategories": {
-            "Blazers": {"weight": 0.80, "cbm": 0.018},
-            "Lightweight Blazers": {"weight": 0.70, "cbm": 0.018},
-            "Suit Pants": {"weight": 0.75, "cbm": 0.018},
-            "Suit Sets": {"weight": 1.00, "cbm": 0.018},
-        }
-    },
-
-    "Partywear": {
-        "default": {"weight": 0.60, "cbm": 0.006},
-        "subcategories": {
-            "Prom Dresses": {"weight": 1.60, "cbm": 0.006},
-            "Formal & Evening Dresses": {"weight": 1.30, "cbm": 0.006},
-            "Cocktail Dresses": {"weight": 0.95, "cbm": 0.006},
-            "Party Jumpsuits": {"weight": 0.95, "cbm": 0.006},
-            "Homecoming Dresses": {"weight": 1.10, "cbm": 0.006},
-            "Semi-formal Dresses": {"weight": 1.05, "cbm": 0.006},
-            "Maxi Party Dresses": {"weight": 1.35, "cbm": 0.006},
-            "Modest Evening Dresses": {"weight": 1.30, "cbm": 0.006},
-        }
-    },
-
-    "Maternity Clothing": {
-        "default": {"weight": 0.70, "cbm": 0.007},
-        "subcategories": {
-            "Maternity Dresses": {"weight": 0.95, "cbm": 0.007},
-            "Nursing": {"weight": 0.65, "cbm": 0.007},
-            "Maternity Tops": {"weight": 0.55, "cbm": 0.007},
-            "Maternity Bottoms": {"weight": 0.75, "cbm": 0.007},
-            "Jumpsuits & Two-pieces": {"weight": 1.05, "cbm": 0.007},
-            "Maternity Denim": {"weight": 0.95, "cbm": 0.007},
-            "Maternity Gowns": {"weight": 1.60, "cbm": 0.007},
-            "Maternity Photoshoot": {"weight": 1.40, "cbm": 0.007},
-            "Maternity Sweatshirts": {"weight": 0.85, "cbm": 0.007},
-            "Maternity Sweaters": {"weight": 0.85, "cbm": 0.007},
-            "Maternity Coats & Jackets": {"weight": 1.25, "cbm": 0.007},
-        }
-    },
-
-    "Shoes": {
-        "default": {"weight": 1.20, "cbm": 0.010},
-        "subcategories": {
-            "Heels": {"weight": 1.05, "cbm": 0.010},
-            "Sneakers": {"weight": 1.20, "cbm": 0.010},
-            "Sandals": {"weight": 0.95, "cbm": 0.010},
-            "Sports Shoes": {"weight": 1.30, "cbm": 0.010},
-            "Flats & Slip-Ons": {"weight": 0.95, "cbm": 0.010},
-            "Slides & Flip-Flops": {"weight": 0.85, "cbm": 0.010},
-            "Boots": {"weight": 1.40, "cbm": 0.010},
-            "Shoe Care": {"weight": 0.50, "cbm": 0.010},
-            "Bundles": {"weight": 2.20, "cbm": 0.010},
-        }
-    },
-
-    "Bags": {
-        "default": {"weight": 1.30, "cbm": 0.020},
-        "subcategories": {
-            "Shoulder Bags": {"weight": 0.70, "cbm": 0.020},
-            "Backpacks": {"weight": 0.90, "cbm": 0.020},
-            "Shoppers & Totes": {"weight": 0.80, "cbm": 0.020},
-            "Crossbody Bags": {"weight": 0.65, "cbm": 0.020},
-            "Clutches": {"weight": 0.50, "cbm": 0.020},
-            "Satchels": {"weight": 0.85, "cbm": 0.020},
-            "Purses": {"weight": 0.60, "cbm": 0.020},
-            "Cosmetic Bags": {"weight": 0.50, "cbm": 0.020},
-            "Sports Bags": {"weight": 1.00, "cbm": 0.020},
-            "Duffle Bags": {"weight": 1.20, "cbm": 0.020},
-            "Laptop Bags & Sleeves": {"weight": 0.50, "cbm": 0.020},
-            "Belt Bags": {"weight": 0.50, "cbm": 0.020},
-        }
-    },
-
-    "Accessories": {
-        "default": {"weight": 0.50, "cbm": 0.004},
-        "subcategories": {
-            "Bracelets": {"weight": 0.20, "cbm": 0.004},
-            "Necklaces": {"weight": 0.20, "cbm": 0.004},
-            "Ring Sets": {"weight": 0.20, "cbm": 0.004},
-            "Earrings": {"weight": 0.20, "cbm": 0.004},
-            "Anklets": {"weight": 0.20, "cbm": 0.004},
-            "Watches": {"weight": 0.20, "cbm": 0.004},
-            "Sunglasses": {"weight": 0.20, "cbm": 0.004},
-            "Hair Accessories": {"weight": 0.20, "cbm": 0.004},
-            "Scarves": {"weight": 0.55, "cbm": 0.004},
-            "Belts": {"weight": 0.65, "cbm": 0.004},
-            "The Hat Store": {"weight": 0.60, "cbm": 0.004},
-            "Sports Gear": {"weight": 0.90, "cbm": 0.004},
-        }
-    },
-
-    "Nightwear": {
-        "default": {"weight": 0.50, "cbm": 0.005},
-        "subcategories": {
-            "Pyjama Sets": {"weight": 0.75, "cbm": 0.005},
-            "Pyjama Pants": {"weight": 0.55, "cbm": 0.005},
-            "Nighties": {"weight": 0.55, "cbm": 0.005},
-            "Tops": {"weight": 0.45, "cbm": 0.005},
-            "Robes": {"weight": 0.85, "cbm": 0.005},
-            "Loungewear": {"weight": 0.75, "cbm": 0.005},
-            "Shorts": {"weight": 0.45, "cbm": 0.005},
-            "Slips": {"weight": 0.45, "cbm": 0.005},
-        }
-    },
-}
-
-
-def get_category_data(category_name):
-    """
-    Retrieves weight and CBM data for a given category/subcategory.
-
-    Args:
-        category_name: String representing category or subcategory name.
-                      Can be "Category" or "Category > Subcategory"
-
-    Returns:
-        Tuple of (weight, cbm)
-    """
-    DEFAULT = (0.5, 0.005)
-
-    if not category_name:
-        return DEFAULT
-
-    category_name = category_name.strip()
-
-    # Handle hierarchical format: "Category > Subcategory"
-    if ">" in category_name:
-        parts = [p.strip() for p in category_name.split(">")]
-        category = parts[0]
-        subcategory = parts[-1] if len(parts) > 1 else None
-
-        if category in CATEGORY_DATA:
-            cat_data = CATEGORY_DATA[category]
-
-            if subcategory and "subcategories" in cat_data:
-                if subcategory in cat_data["subcategories"]:
-                    data = cat_data["subcategories"][subcategory]
-                    return data["weight"], data["cbm"]
-
-                # Fuzzy match on subcategory
-                subcategory_lower = subcategory.lower()
-                for sub_key, sub_data in cat_data["subcategories"].items():
-                    if subcategory_lower in sub_key.lower() or sub_key.lower() in subcategory_lower:
-                        return sub_data["weight"], sub_data["cbm"]
-
-            return cat_data["default"]["weight"], cat_data["default"]["cbm"]
-
-    # Exact match as main category
-    if category_name in CATEGORY_DATA:
-        data = CATEGORY_DATA[category_name]["default"]
-        return data["weight"], data["cbm"]
-
-    # Search as subcategory across all categories
-    category_name_lower = category_name.lower()
-    for cat_key, cat_data in CATEGORY_DATA.items():
-        if "subcategories" in cat_data:
-            if category_name in cat_data["subcategories"]:
-                data = cat_data["subcategories"][category_name]
-                return data["weight"], data["cbm"]
-
-            for sub_key, sub_data in cat_data["subcategories"].items():
-                if category_name_lower in sub_key.lower() or sub_key.lower() in category_name_lower:
-                    return sub_data["weight"], sub_data["cbm"]
-
-    # Fuzzy match on main category
-    for cat_key, cat_data in CATEGORY_DATA.items():
-        if category_name_lower in cat_key.lower() or cat_key.lower() in category_name_lower:
-            return cat_data["default"]["weight"], cat_data["default"]["cbm"]
-
-    return DEFAULT
-
-
-def calculate_commission(price_usd):
-    if price_usd <= 10:
-        return price_usd * 0.50
-    elif price_usd <= 20:
-        return price_usd * 0.45
-    elif price_usd <= 30:
-        return price_usd * 0.40
-    elif price_usd <= 40:
-        return price_usd * 0.35
-    elif price_usd <= 50:
-        return price_usd * 0.30
-    else:
-        return price_usd * 0.25
-
-
-def calculate_shipping_sea(cbm: float) -> float:
-    """Calculate sea shipping cost with 10% buffer."""
-    return round(cbm * 1.10 * SEA_USD_PER_CBM, 2)
-
-
-def calculate_shipping_air(weight_kg: float) -> float:
-    """Calculate air shipping cost with 10% buffer."""
-    return round(max(MIN_AIR_USD, weight_kg * 1.10 * AIR_USD_PER_KG), 2)
-
-
 
 def group_variants_by_url(variants: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     """
@@ -605,6 +291,7 @@ def build_price_payload(
     discounted_price: float,
     discount_percentage: str,
     category_name: str,
+    pricing_config: PricingConfig,
     usd_to_aed: float = USD_TO_AED,
     usd_to_iqd: float = USD_TO_IQD,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
@@ -614,27 +301,41 @@ def build_price_payload(
         raise ValueError("Invalid price: must be > 0")
 
     price_usd = round(base_price / usd_to_aed, 2)
-    discount_usd = round(discounted_price / usd_to_aed, 2) if discounted_price > 0 else 0
+    has_discount = discounted_price > 0 and discounted_price < base_price
+    discount_usd = round(discounted_price / usd_to_aed, 2) if has_discount else 0
 
-    weight_kg, cbm = get_category_data(category_name)
-    commission = calculate_commission(price_usd)
-    commission_discount = calculate_commission(discount_usd)
-    shipping_sea = calculate_shipping_sea(cbm)
-    shipping_air = calculate_shipping_air(weight_kg)
+    weight_kg, cbm, tiers = pricing_config.get_weight_cbm_tiers(category_name)
+    commission = round(calculate_commission(price_usd, tiers), 2)
+    commission_discount = round(calculate_commission(discount_usd, tiers), 2) if has_discount else 0
+    shipping_sea = calculate_shipping_sea(cbm, pricing_config.shipping)
+    shipping_air = calculate_shipping_air(weight_kg, pricing_config.shipping)
 
     total_usd = price_usd + commission + shipping_air
-    total_discount_usd = discount_usd + commission_discount + shipping_air
-
     iqd_price = int(math.ceil((total_usd * usd_to_iqd) / 250) * 250)
-    iqd_discount = int(math.ceil((total_discount_usd * usd_to_iqd) / 250) * 250)
 
-    discount_pct_value = round(((iqd_price - iqd_discount) / iqd_price) * 100, 2) if iqd_price else 0
+    # When there's no real discount, force iqd_discount equal to iqd_price and
+    # discount_percentage to 0 — otherwise the residual shipping/commission flow
+    # makes a no-discount product look ~90% off, which is what surfaced in
+    # discount_percentage = 90 with amazon_discount_uae = null.
+    if has_discount:
+        total_discount_usd = discount_usd + commission_discount + shipping_air
+        iqd_discount = int(math.ceil((total_discount_usd * usd_to_iqd) / 250) * 250)
+        discount_pct_value = (
+            round(((iqd_price - iqd_discount) / iqd_price) * 100, 2)
+            if iqd_price and iqd_discount < iqd_price else 0
+        )
+    else:
+        iqd_discount = iqd_price
+        discount_pct_value = 0
 
+    # When there's no real discount, mirror the price into the discount slot
+    # (instead of leaving 0/empty). API consumers prefer a numeric discount that
+    # equals the regular price over a sentinel zero or null.
     block = {
         "amazon_price_uae": base_price,
-        "amazon_discount_uae": discounted_price if discounted_price > 0 else 0,
+        "amazon_discount_uae": discounted_price if has_discount else base_price,
         "amazon_price": price_usd,
-        "amazon_discount": discount_usd,
+        "amazon_discount": discount_usd if has_discount else price_usd,
         "hanooot_price": iqd_price,
         "hanooot_discount": iqd_discount,
         "commission": commission,
@@ -648,24 +349,53 @@ def build_price_payload(
     return block, block.copy()
 
 
+_PRICE_FIELDS_TO_COMPARE = (
+    "amazon_price_uae",
+    "amazon_discount_uae",
+    "amazon_price",
+    "amazon_discount",
+    "hanooot_price",
+    "hanooot_discount",
+    "commission",
+    "commission_discount",
+    "shipping_cost",
+    "shipping_cost_by_air",
+    "discount_percentage",
+)
+
+
+def _to_rounded_float(value: Any) -> float:
+    """Coerce stored or computed price values to float rounded to 2 decimals.
+    Tolerates legacy empty-string values (commission/shipping pre-dynamic-config)."""
+    try:
+        return round(float(value or 0), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _price_block_changed(old_price: Dict[str, Any], new_price: Dict[str, Any]) -> bool:
+    """Compare every field that build_price_payload produces, rounded to 2 decimals.
+    Catches drift from dynamic-config changes (commission tier, shipping rates) even
+    when the scraped raw AED price is unchanged."""
+    for field in _PRICE_FIELDS_TO_COMPARE:
+        if _to_rounded_float(old_price.get(field)) != _to_rounded_float(new_price.get(field)):
+            return True
+    return False
+
+
 def has_data_changed(
     current_variant: Dict[str, Any],
     new_price_block: Dict[str, Any],
     new_quantity: int,
     new_availability_status: str,
 ) -> bool:
-    """
-    Check if any meaningful data has changed.
-    Compares hanooot_price/discount, availability.quantity, availability.status.
-    Returns True if PATCH is needed.
-    """
-    current_price = current_variant.get("price", {})
-    if current_price.get("hanooot_price") != new_price_block.get("hanooot_price"):
-        return True
-    if current_price.get("hanooot_discount") != new_price_block.get("hanooot_discount"):
+    """Return True if PATCH is needed.
+    Compares the full price block plus availability — so dynamic-config changes
+    (commission tier, shipping constants) propagate to all variants on the next
+    cycle even if the scraped raw price is identical."""
+    if _price_block_changed(current_variant.get("price") or {}, new_price_block):
         return True
 
-    # Use availability.quantity (replaces stock.quantity)
     current_availability = current_variant.get("availability", {})
     if current_availability.get("quantity") != new_quantity:
         return True
@@ -707,6 +437,7 @@ async def apply_scraped_to_variants(
     scraped_data: Dict[str, Any],
     task_id: str,
     start_index: int,
+    pricing_config: PricingConfig,
     usd_to_aed: float = USD_TO_AED,
     usd_to_iqd: float = USD_TO_IQD,
     client: Optional[ScraperClient] = None,
@@ -786,7 +517,8 @@ async def apply_scraped_to_variants(
 
                     u, s = await apply_scraped_to_variants(
                         correct_url, cvariants, cdata_single,
-                        task_id, idx, usd_to_aed=usd_to_aed, usd_to_iqd=usd_to_iqd,
+                        task_id, idx, pricing_config,
+                        usd_to_aed=usd_to_aed, usd_to_iqd=usd_to_iqd,
                         client=client,
                     )
                     total_updated += u
@@ -815,6 +547,7 @@ async def apply_scraped_to_variants(
             discounted_price,
             str(discount_percentage) if discount_percentage is not None else "0",
             category_name,
+            pricing_config,
             usd_to_aed=usd_to_aed,
             usd_to_iqd=usd_to_iqd,
         )
@@ -912,6 +645,7 @@ async def update_variant_batch(
     variants: List[Dict[str, Any]],
     task_id: str,
     start_index: int,
+    pricing_config: PricingConfig,
     usd_to_aed: float = USD_TO_AED,
     usd_to_iqd: float = USD_TO_IQD,
 ) -> tuple[int, int]:
@@ -938,6 +672,7 @@ async def update_variant_batch(
 
     return await apply_scraped_to_variants(
         url, variants, scraped_data, task_id, start_index,
+        pricing_config,
         usd_to_aed=usd_to_aed, usd_to_iqd=usd_to_iqd,
     )
 
@@ -1201,6 +936,7 @@ async def _patcher_worker(
     counts: List[int],
     usd_to_aed: float,
     usd_to_iqd: float,
+    pricing_config: PricingConfig,
     total_records_ref: Optional[List[Optional[int]]] = None,
     variants_completed_ref: Optional[List[int]] = None,
     on_progress_cb: Optional[Any] = None,
@@ -1217,6 +953,7 @@ async def _patcher_worker(
             url, variants, scraped_data, start_index = item
             updated, skipped = await apply_scraped_to_variants(
                 url, variants, scraped_data, task_id, start_index,
+                pricing_config,
                 usd_to_aed=usd_to_aed, usd_to_iqd=usd_to_iqd,
             )
             counts[0] += updated
@@ -1256,10 +993,26 @@ async def update_primark_prices_pipeline(
     usd_to_iqd: float = USD_TO_IQD,
     queue_max_size: int = 500,
     on_progress: Optional[Any] = None,
+    pricing_config: Optional[PricingConfig] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Run price update as a pipeline: Fetcher | Scraper | Patcher running in parallel.
+
+    `pricing_config` is fetched once at the start of a run and held constant for
+    the whole pipeline. Cron entrypoints fetch it explicitly so all pipeline
+    stages see the same snapshot; if not supplied, this function will fetch it
+    here (raising on failure — we never silently fall back to stale prices).
     """
+    if pricing_config is None:
+        pricing_config = await fetch_pricing_config()
+        append_log(
+            task_id,
+            f"Pricing config loaded: {len(pricing_config.categories)} categories, "
+            f"sea={pricing_config.shipping.sea_usd_per_cbm}/cbm, "
+            f"air={pricing_config.shipping.air_usd_per_kg}/kg",
+            "info",
+        )
+
     logger.info(f"[{task_id}] Starting pipeline (Fetcher → Scraper → Patcher). Concurrency: {concurrency}")
     append_log(
         task_id,
@@ -1288,6 +1041,7 @@ async def update_primark_prices_pipeline(
     patcher_tasks = [
         asyncio.create_task(_patcher_worker(
             patch_queue, task_id, counts, usd_to_aed, usd_to_iqd,
+            pricing_config,
             total_records_ref=total_records_ref,
             variants_completed_ref=variants_completed_ref,
             on_progress_cb=on_progress,
@@ -1329,6 +1083,7 @@ async def update_primark_prices(
     usd_to_aed: float = USD_TO_AED,
     usd_to_iqd: float = USD_TO_IQD,
     on_progress: Optional[Any] = None,
+    pricing_config: Optional[PricingConfig] = None,
 ) -> Optional[Dict[str, Any]]:
     """Main entry: run Fetcher → Scraper → Patcher pipeline."""
     return await update_primark_prices_pipeline(
@@ -1341,6 +1096,7 @@ async def update_primark_prices(
         usd_to_aed=usd_to_aed,
         usd_to_iqd=usd_to_iqd,
         on_progress=on_progress,
+        pricing_config=pricing_config,
     )
 
 

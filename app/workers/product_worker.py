@@ -15,6 +15,7 @@ from arq.connections import RedisSettings
 from dotenv import load_dotenv
 
 from app.config import set_environment
+from app.core.pricing_config import fetch_pricing_config
 from app.core.task_primark import update_primark_prices
 from app.utils.color_utils import get_color_hexes_from_variants
 from app.utils.image_processing import DownloadImage
@@ -340,6 +341,25 @@ async def scheduled_price_update(ctx):
         task_id=task_id,
     )
 
+    # Fetch the pricing config (categories/tiers/shipping constants) ONCE at
+    # the start of this run. The same snapshot is reused for every variant so
+    # prices within a single cron run are computed against a consistent ruleset
+    # even if the remote config changes mid-run. If the fetch fails after
+    # retries, abort — never silently fall back to stale constants in a
+    # pricing job (mirrors namshi's scheduled_price_update).
+    try:
+        pricing_config = await fetch_pricing_config()
+    except Exception as exc:
+        logger.error(f"[cron] Failed to fetch pricing config: {exc}", exc_info=True)
+        await update_job_stats(
+            redis_pool, job_id, "failed",
+            error=f"pricing_config fetch failed: {exc}",
+            start_time=start_time.isoformat(),
+            end_time=datetime.utcnow().isoformat(),
+            task_id=task_id,
+        )
+        raise
+
     async def on_progress(progress: dict):
         await update_job_stats(
             redis_pool, job_id, "running",
@@ -357,6 +377,7 @@ async def scheduled_price_update(ctx):
             batch_size=100,
             concurrency=5,
             on_progress=on_progress,
+            pricing_config=pricing_config,
         )
 
         if job_id.startswith("cron:"):
