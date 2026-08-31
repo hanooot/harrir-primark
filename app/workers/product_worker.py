@@ -431,10 +431,15 @@ class Settings:
     redis_settings = RedisSettings(host=REDIS_HOST, port=REDIS_PORT)
     queue_name = "arq:product"
     functions = [process_full_product, finalize_task, scheduled_price_update]
+    # Primark price-update fires at 06:00 and 18:00 UTC.
+    # Schedules across the projects are staggered 2 hours apart so the
+    # commission API, source-store APIs and our own backend don't all get hit
+    # simultaneously: Namshi 00/12 → Sephora 02/14 → Splash 04/16 →
+    # Primark 06/18 → BrandsForLess 08/20.
     cron_jobs = [
         cron(
             scheduled_price_update,
-            hour={0, 12},
+            hour={6, 18},
             minute=0,
             run_at_startup=False,
             max_tries=1,
