@@ -37,20 +37,41 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 
-async def upload_images_to_s3(ctx, task_id: str, product_id: str, image_urls: List[str]) -> Dict[str, str]:
-    """Upload all product images to S3."""
-    try:
-        logger.info(f"[{task_id}] 📤 Uploading {len(image_urls)} images for {product_id}")
+async def _upload_variant_images(
+    task_id: str,
+    product_id: str,
+    product_data: Dict[str, Any],
+) -> None:
+    """Upload each variant's images to images/PRIMARK/{product_id}/{variant_asin}/ and
+    replace `variant["product_images"]` with the returned CloudFront URLs. After all
+    variants are uploaded, product-level `images_gallery` / `Product_images` are set
+    to a copy of variant[0]'s uploaded URLs so the product doc never carries a union
+    of every colour's images."""
+    variants = product_data.get("variants") or []
+    if not variants:
+        return
 
-        uploader = DownloadImage(task_id=task_id)
-        s3_urls = await asyncio.to_thread(uploader.upload_images_to_s3, image_urls)
-        upload_map = {src: dst for src, dst in zip(image_urls, s3_urls)}
+    uploader = DownloadImage(task_id=task_id)
 
-        logger.info(f"[{task_id}] ✅ Uploaded {len(upload_map)} images for {product_id}")
-        return upload_map
-    except Exception as e:
-        logger.error(f"[{task_id}] ❌ Image upload failed for {product_id}: {e}")
-        return {url: url for url in image_urls}
+    for variant in variants:
+        v_asin = (variant.get("ASIN") or variant.get("SKU") or variant.get("variant_id") or "unknown").strip() or "unknown"
+        v_images = variant.get("product_images") or variant.get("images") or []
+        if not v_images:
+            variant["product_images"] = []
+            continue
+        try:
+            v_s3_urls = await asyncio.to_thread(
+                uploader.upload_images_to_s3, v_images, "PRIMARK", product_id, v_asin
+            )
+            variant["product_images"] = list(v_s3_urls)
+            logger.info(f"[{task_id}] ✅ Uploaded {len(v_s3_urls)} images for variant {v_asin}")
+        except Exception as e:
+            logger.error(f"[{task_id}] ❌ Variant {v_asin} image upload failed: {e}")
+            variant["product_images"] = list(v_images)
+
+    v0_images = list(variants[0].get("product_images") or [])
+    product_data["images_gallery"] = list(v0_images)
+    product_data["Product_images"] = list(v0_images)
 
 
 def _color_to_first_image_url(variants: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -107,33 +128,17 @@ async def apply_data_and_post(
     task_id: str,
     product_id: str,
     product_data: Dict[str, Any],
-    upload_map: Dict[str, str],
     color_hexes: Dict[str, Dict[str, str]],
 ) -> bool:
     """
-    Merge upload/color results into product_data and POST to API.
+    Apply color results to product_data and POST to API.
     Variant schema: color (LocalizedText), color_hex (str), source_color (str), size (str).
-    Leaves variant.size and other variant fields unchanged.
+    Leaves variant.size and other variant fields unchanged. Image URLs are mapped to
+    S3 upstream in process_full_product.
     """
     try:
         # Shallow copy so we don't mutate the original
         data = product_data.copy()
-
-        # Update product-level images with S3 URLs
-        if "images_gallery" in data:
-            data["images_gallery"] = [
-                upload_map.get(url, url) for url in data["images_gallery"]
-            ]
-        if "Product_images" in data:
-            data["Product_images"] = [
-                upload_map.get(url, url) for url in data["Product_images"]
-            ]
-
-        for variant in data.get("variants", []):
-            if "product_images" in variant:
-                variant["product_images"] = [
-                    upload_map.get(url, url) for url in variant["product_images"]
-                ]
 
         # Apply color: keep source_color as exact extracted; color (en/ar) and color_hex from API or created.
         # Case-insensitive lookup so "Bordeaux" and "BORDEAUX" both match.
@@ -264,9 +269,9 @@ async def process_full_product(
         color_hexes = await generate_color_hexes(
             ctx, task_id, product_id, product_title, variants=variants
         )
-        upload_map = await upload_images_to_s3(ctx, task_id, product_id, all_images)
+        await _upload_variant_images(task_id, product_id, raw_product_data)
         success = await apply_data_and_post(
-            task_id, product_id, raw_product_data, upload_map, color_hexes
+            task_id, product_id, raw_product_data, color_hexes
         )
         return success
 

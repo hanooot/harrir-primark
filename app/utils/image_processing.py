@@ -23,6 +23,14 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# CloudFront CDN domain that fronts the S3 image bucket. All product image URLs
+# returned by the uploader use this domain so downstream consumers hit the CDN,
+# not S3 directly. Override with the CLOUDFRONT_BASE_URL env var if the CDN
+# changes.
+CLOUDFRONT_BASE_URL = os.getenv(
+    "CLOUDFRONT_BASE_URL", "https://djdbk0dcvb8vt.cloudfront.net"
+).rstrip("/")
+
 
 class DownloadImage:
     """
@@ -57,19 +65,35 @@ class DownloadImage:
         """Log message with task_id."""
         logger.info(f"[{self.task_id}] {message}")
 
-    def upload_images_to_s3(self, image_urls: list[str]) -> list[str]:
+    def upload_images_to_s3(
+        self,
+        image_urls: list[str],
+        source_type: str = "PRIMARK",
+        product_asin: str = "unknown",
+        variant_asin: str | None = None,
+    ) -> list[str]:
         """
         Upload images to an Amazon S3 bucket and return uploaded URLs
         in the same order as provided (falls back to original URL on failure).
+
+        S3 Path: /images/{source_type}/{product_asin}/{variant_asin?}/image_{index}.{ext}
         """
         uploaded_image_urls: list[str] = []
 
-        for url in image_urls:
+        if variant_asin:
+            prefix = posixpath.join("images", source_type, product_asin, variant_asin)
+        else:
+            prefix = posixpath.join("images", source_type, product_asin)
+
+        for i, url in enumerate(image_urls, start=1):
             s3_url: str | None = None
             try:
                 if url and url != "None":
                     parsed = urlparse(url)
-                    image_filename = os.path.basename(parsed.path)
+                    _, ext = os.path.splitext(os.path.basename(parsed.path))
+                    if not ext:
+                        ext = ".jpg"
+                    image_filename = f"image_{i}{ext}"
                     response = None
 
                     # Determine if the URL contains "sephora" and use the proxy if so
@@ -104,17 +128,14 @@ class DownloadImage:
                     if response and response.status_code == 200:
                         content_type = response.headers.get("Content-Type", "image/jpeg")
                         content_io = io.BytesIO(response.content)
-                        s3_object_key = posixpath.join("product", image_filename)
+                        s3_object_key = posixpath.join(prefix, image_filename)
                         self.s3_client.upload_fileobj(
                             content_io,
                             self.bucket,
                             s3_object_key,
                             ExtraArgs={"ContentType": content_type, "ACL": "public-read"},
                         )
-                        s3_url = (
-                            f"https://s3.{self.region}.amazonaws.com/"
-                            f"{self.bucket}/{s3_object_key.replace('+','%2B')}"
-                        )
+                        s3_url = f"{CLOUDFRONT_BASE_URL}/{s3_object_key.replace('+','%2B')}"
                     else:
                         self.log(f"Failed to download image from URL: {url}")
             except requests.exceptions.Timeout:
@@ -133,14 +154,14 @@ class DownloadImage:
 
         return uploaded_image_urls
 
-    def upload_images(self, images):
+    def upload_images(self, images, source_type: str = "PRIMARK", product_asin: str = "unknown", variant_asin: str | None = None):
         """
         Uploads images to S3 and returns concatenated URL string.
         """
         if images == "" or images is None:
             return ""
         image_urls = images.split("|")
-        uploaded_urls = self.upload_images_to_s3(image_urls)
+        uploaded_urls = self.upload_images_to_s3(image_urls, source_type, product_asin, variant_asin)
         return "|".join(uploaded_urls)
 
 
@@ -208,10 +229,7 @@ class ThumbnailDownloadImage:
                 "ACL": "public-read",
             },
         )
-        s3_url = (
-            f"https://s3.{self.region}.amazonaws.com/"
-            f"{self.bucket}/{s3_object_key.replace('+','%2B')}"
-        )
+        s3_url = f"{CLOUDFRONT_BASE_URL}/{s3_object_key.replace('+','%2B')}"
         self.uploaded_image_urls.append(s3_url)
 
     def process_image_url(self, url, folder_name):
