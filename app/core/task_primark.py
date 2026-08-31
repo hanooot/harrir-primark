@@ -97,6 +97,11 @@ from app.utils.primark_utils import (
 from app.core.primark_scraper_api import (
     PrimarkScraper,
     _parse_price_number,
+    get_style_code_by_url,
+    gql_get,
+    get_attr,
+    GET_PRODUCT_SEARCH_DETAILS_QUERY,
+    SEARCH_HEADERS,
 )
 from app.core.pricing_config import (
     PricingConfig,
@@ -146,65 +151,132 @@ def group_variants_by_url(variants: List[Dict[str, Any]]) -> Dict[str, List[Dict
     return dict(url_groups)
 
 
+def _pack_primark_color(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn one accumulated color entry into the scraped-data shape the patcher
+    expects: {variant_sku, original_price, discounted_price, discount_percentage,
+    size_stock, color_links}."""
+    regular = float(entry.get("regular") or 0)
+    final = float(entry.get("final") or 0)
+    has_discount = regular > 0 and final > 0 and final < regular
+    discount_pct = f"{round((regular - final) / regular * 100)}%" if has_discount else ""
+    return {
+        "variant_sku": "",
+        "original_price": regular if regular > 0 else final,
+        "discounted_price": final if has_discount else 0,
+        "discount_percentage": discount_pct,
+        "size_stock": entry.get("sizes", []),
+        "color_links": [],
+    }
+
+
 async def scrape_product_data(
     url: str,
     timeout: int = 15,
     client: Optional[ScraperClient] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Scrape product page once and extract all data using rnet (no fallback).
-    Returns: {original_price, discounted_price, discount_percentage, size_stock, color_links}
+    Re-fetch fresh Primark price/stock via the Magento GraphQL API.
+
+    Primark serves no scrapeable PDP HTML (the storefront is GraphQL/Algolia
+    backed), so a price refresh resolves the product's style_code from its
+    url_key and queries `productSearch` for current per-size price and stock.
+
+    For multi-color products every color shares one url_key, so the first call
+    returns one synthetic per-color URL (`?clr=<color>`) in `color_links`;
+    `apply_scraped_to_variants` then re-calls this function once per color so
+    each color's variants are priced/stocked from their own GraphQL variant.
+
+    Returns: {variant_sku, original_price, discounted_price,
+              discount_percentage, size_stock, color_links}
     """
-    url = remove_utm_source(url)
-    http_client = client if client is not None else RNET_CLIENT
-    if http_client is None:
-        logger.error("No scraper client available; cannot scrape.")
+    parsed = urlparse(url)
+    qs = dict(parse_qsl(parsed.query))
+    color_filter = (qs.get("clr") or "").strip().lower()
+    url_key = parsed.path.rstrip("/").split("/")[-1]
+    if not url_key:
+        logger.warning(f"Primark scrape: could not derive url_key from {url}")
         return None
 
     try:
-        resp = await http_client.get(url, headers=PRIMARK_REQUEST_HEADERS, timeout=timeout)
-        status = int(resp.status) if hasattr(resp.status, "__int__") else resp.status
-        status_int = int(status) if not isinstance(status, int) else status
-        if str(status).startswith("404"):
-            logger.warning(f"rnet fetch failed with status 404 for {url}. Returning 404 marker.")
-            return {"rnet_status_404": True}
-        if not str(status).startswith("200"):
-            logger.warning(f"rnet fetch failed with status {status} for {url}")
-            # 429/5xx indicate the edge is throttling this connection — rotate so the retry doesn't reuse it.
-            if status_int in (429, 502, 503, 504):
-                http_client.rotate_on_server_throttle(status_int)
-            return None
-
-        text = await resp.text()
-        if not text:
-            return None
-
-        # Delegate parsing to the static method in PrimarkScraper
-        page = PrimarkScraper._parse_product_page_sync(text, url)
-        if not page:
-            return None
-
-        original = _parse_price_number(page.get("original_price_text", ""))
-        selling = _parse_price_number(page.get("selling_price_text", ""))
-        discount_txt = str(page.get("discount_percentage_text", "")).strip()
-
-        discount_pct = ""
-        match = re.findall(r"\d+", discount_txt)
-        if match:
-            discount_pct = f"{match[0]}%"
-
-        return {
-            "variant_sku": page.get("variant_sku", ""),
-            "original_price": original,
-            "discounted_price": selling,
-            "discount_percentage": discount_pct,
-            "size_stock": page.get("size_stock", []),
-            "color_links": page.get("color_links", []),
-        }
+        style_code = await asyncio.to_thread(get_style_code_by_url, url_key)
     except Exception as e:
-        logger.error(f"Error scraping {url} with rnet: {e}")
-        http_client.handle_exception(e)
+        logger.warning(f"Primark GraphQL style lookup failed for {url_key}: {e}")
         return None
+    if not style_code:
+        logger.warning(f"Primark scrape: no style_code for url_key {url_key}")
+        return None
+
+    def _gql_fetch_items():
+        variables = {
+            "phrase": "",
+            "filter": [{"attribute": "style_code", "eq": style_code}],
+            "sort": [{"attribute": "price", "direction": "DESC"}],
+            "pageSize": 100,
+        }
+        data = gql_get(GET_PRODUCT_SEARCH_DETAILS_QUERY, variables, SEARCH_HEADERS)
+        return data.get("data", {}).get("productSearch", {}).get("items", []) or []
+
+    try:
+        items = await asyncio.to_thread(_gql_fetch_items)
+    except Exception as e:
+        logger.warning(f"Primark GraphQL fetch failed for style {style_code}: {e}")
+        return None
+
+    # Style no longer returns any product → treat as removed (patcher deletes).
+    if not items:
+        logger.warning(f"Primark scrape: style {style_code} returned no items (404).")
+        return {"rnet_status_404": True}
+
+    # Accumulate per-color: each color carries its size/stock list plus the
+    # regular/final price (max across its variants).
+    colors: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        pv = item.get("productView") or {}
+        pv_attrs = pv.get("attributes") or []
+        for vv in (pv.get("variants") or {}).get("variants") or []:
+            prod = vv.get("product") or {}
+            attrs = prod.get("attributes") or []
+            color = get_attr(attrs, "color") or get_attr(pv_attrs, "color") or "Unknown"
+            size = get_attr(attrs, "size") or ""
+            in_stock = bool(prod.get("inStock"))
+            price_obj = prod.get("price") or {}
+            final_v = ((price_obj.get("final") or {}).get("amount") or {}).get("value")
+            reg_v = ((price_obj.get("regular") or {}).get("amount") or {}).get("value")
+            final_num = float(final_v) if final_v not in (None, "") else 0.0
+            reg_num = float(reg_v) if reg_v not in (None, "") else 0.0
+
+            ck = color.strip().lower()
+            entry = colors.setdefault(
+                ck, {"color": color, "sizes": [], "regular": 0.0, "final": 0.0}
+            )
+            entry["sizes"].append({
+                "size": size,
+                "stock": 1 if in_stock else 0,
+                "stock_status": "in_stock" if in_stock else "out_of_stock",
+                "sku": prod.get("sku", ""),
+            })
+            entry["regular"] = max(entry["regular"], reg_num)
+            entry["final"] = max(entry["final"], final_num)
+
+    if not colors:
+        logger.warning(f"Primark scrape: style {style_code} had no variant data.")
+        return None
+
+    # Recursive per-color call → return only that color's data.
+    if color_filter:
+        entry = colors.get(color_filter) or next(iter(colors.values()))
+        return _pack_primark_color(entry)
+
+    # First call: return the first color's data, and (for multi-color products)
+    # advertise per-color URLs so the patcher re-scrapes each color separately.
+    base = urlunparse(parsed._replace(query="", fragment=""))
+    result = _pack_primark_color(next(iter(colors.values())))
+    if len(colors) > 1:
+        result["color_links"] = [
+            {"color": e["color"], "url": f"{base}?clr={e['color']}"}
+            for e in colors.values()
+        ]
+    return result
 
 
 _EMBED_SERVICE_TASKS: set[asyncio.Task] = set()
