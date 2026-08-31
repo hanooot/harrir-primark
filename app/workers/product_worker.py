@@ -221,16 +221,17 @@ async def apply_data_and_post(
         data["attributes"]["colors"]["ar"] = unique_colors_ar
 
         # POST to API
-        logger.info(f"[{task_id}] 🚀 Posting product {product_id} to API")
+        asin = data.get("ASIN", "?")
+        logger.info(f"[{task_id}] 🚀 Posting product {product_id} (ASIN={asin}) to API")
         success, error = await asyncio.to_thread(post_product_to_api, {"data": data})
 
         if success:
-            logger.info(f"[{task_id}] ✅ Successfully posted product {product_id}")
-            append_log(task_id, f"✅ Product {product_id} posted successfully", "info")
+            logger.info(f"[{task_id}] ✅ Successfully posted product {product_id} (ASIN={asin})")
+            append_log(task_id, f"✅ Product {product_id} (ASIN={asin}) posted successfully", "info")
             return True
         else:
-            logger.error(f"[{task_id}] ❌ Failed to post product {product_id}: {error}")
-            append_log(task_id, f"❌ Failed to post product {product_id}: {error}", "error")
+            logger.error(f"[{task_id}] ❌ Failed to post product {product_id} (ASIN={asin}): {error}")
+            append_log(task_id, f"❌ Failed to post product {product_id} (ASIN={asin}): {error}", "error")
             return False
 
     except Exception as e:
@@ -329,7 +330,7 @@ async def scheduled_price_update(ctx):
     Publishes progress/status to Redis so /price-updater/status and /history see it."""
     job_id = ctx.get("job_id", "unknown")
     redis_pool = ctx.get("redis")
-    task_id = f"scheduled-price-{job_id[:8]}"
+    task_id = job_id
     start_time = datetime.utcnow()
 
     active, prev_job_id = await is_previous_run_active(redis_pool, job_id)

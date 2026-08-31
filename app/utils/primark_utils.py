@@ -7,15 +7,17 @@ from app.config import get_config
 
 logger = logging.getLogger(__name__)
 
+LOG_SOURCE = "primark"
 
-def append_log(task_id: str, message: str, level: str = "debug") -> None:
+
+def append_log(task_id: str, message: str, level: str = "debug", source: str | None = None) -> None:
     """Send log message to job log API; continue silently on failure."""
     cfg = get_config()
     if not cfg.AUTOMATION_BACKEND_URL:
         return
     try:
         url = f"{cfg.AUTOMATION_BACKEND_URL}/logs/ingest"
-        payload = {"task_id": task_id, "message": message, "level": level}
+        payload = {"task_id": task_id, "message": message, "level": level, "source": source or LOG_SOURCE}
         headers = {"Content-Type": "application/json", "X-API-KEY": cfg.API_KEY}
 
         logger.info("Sending POST request")
