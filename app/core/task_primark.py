@@ -1,4 +1,6 @@
+from app.core.inventory import source_quantity, mark_missing_variants
 import asyncio
+from contextvars import ContextVar
 import logging
 import os
 import random
@@ -103,6 +105,7 @@ from app.core.primark_scraper_api import (
     GET_PRODUCT_SEARCH_DETAILS_QUERY,
     SEARCH_HEADERS,
 )
+from app.core.product_bulk_sync import BulkProductSync
 from app.core.pricing_config import (
     PricingConfig,
     fetch_pricing_config,
@@ -251,7 +254,7 @@ async def scrape_product_data(
             )
             entry["sizes"].append({
                 "size": size,
-                "stock": 1 if in_stock else 0,
+                "stock": source_quantity(prod.get("stock_quantity"), "Primark variant stock_quantity") if in_stock else 0,
                 "stock_status": "in_stock" if in_stock else "out_of_stock",
                 "sku": prod.get("sku", ""),
             })
@@ -279,13 +282,25 @@ async def scrape_product_data(
     return result
 
 
-_EMBED_SERVICE_TASKS: set[asyncio.Task] = set()
-_PARENT_ASINS_TO_EMBED: set[str] = set()
+# Search-index sync for the running price update (app/core/product_bulk_sync.py):
+# every parent whose write succeeded is sent to the AI-stylist /product/update/bulk
+# in batches DURING the run, confirmed, and spooled to Redis if undeliverable.
+# A ContextVar, not a module global: the tasks a run spawns inherit it, so two runs
+# in one process never share or close each other's sync.
+_PRODUCT_SYNC: ContextVar[Optional[BulkProductSync]] = ContextVar("primark_product_sync", default=None)
+
+
+def _queue_search_update(parent_asin: str) -> None:
+    """Queue a parent ASIN for the search index. Call only AFTER its write succeeded."""
+    sync = _PRODUCT_SYNC.get()
+    if sync is not None:
+        sync.add(parent_asin)
+    else:
+        logger.warning(f"search update for {parent_asin} requested outside a price run — not queued")
 
 # Collector for post-cron price-drop alerts. {ASIN: {"old_price": str, "new_price": str}}.
 # Populated on `hanooot_price` change; flushed in product_worker.scheduled_price_update.
 _PRICE_ALERTS: Dict[str, Dict[str, str]] = {}
-_EMBED_CONCURRENCY: asyncio.Semaphore = asyncio.Semaphore(50)
 
 
 def _derive_parent_asin(variant_asin: str) -> str:
@@ -297,44 +312,6 @@ def _derive_parent_asin(variant_asin: str) -> str:
     if len(parts) == 2 and parts[1].isdigit():
         return parts[0]
     return variant_asin
-
-
-async def _call_embed_service(product: dict):
-    asin = product.get("ASIN") or product.get("asin")
-    async with _EMBED_CONCURRENCY:
-        logger.info(f"_call_embed_service started (asin={asin})")
-        try:
-            url = os.getenv("PRODUCT_UPDATE_URL")
-            if not url:
-                logger.warning("PRODUCT_UPDATE_URL not set in environment")
-                return
-
-            logger.info(f"Calling embed service url={url} asin={asin}")
-            timeout = httpx.Timeout(connect=5.0, read=2.0, write=5.0, pool=5.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                try:
-                    response = await client.patch(
-                        url,
-                        headers={
-                            "accept": "application/json",
-                            "Content-Type": "application/json",
-                        },
-                        json={"asin": asin},
-                    )
-                    logger.info(
-                        f"Embed service responded status={response.status_code} asin={asin}"
-                    )
-                except httpx.ReadTimeout:
-                    logger.info(f"Embed service fire-and-forget dispatched (no response) asin={asin}")
-        except Exception as e:
-            logger.warning(f"Embed service dispatch error asin={asin}: {e}")
-
-
-def _dispatch_embed_service(product: dict) -> None:
-    """Fire-and-forget dispatch of embed service call; keeps task reference to avoid GC."""
-    task = asyncio.create_task(_call_embed_service(product))
-    _EMBED_SERVICE_TASKS.add(task)
-    task.add_done_callback(_EMBED_SERVICE_TASKS.discard)
 
 
 def find_stock_for_size(size_stock_list: List[Dict], size: str) -> Dict[str, Any]:
@@ -539,6 +516,7 @@ async def apply_scraped_to_variants(
             if success:
                 deleted_count += 1
                 logger.info(f"[{task_id}] DELETED {asin} (404)")
+                _queue_search_update(_derive_parent_asin(asin))   # deletion is a search change too: the parent's any_not_deleted / any_in_stock / skus move
                 append_log(task_id, f"[{idx}] 🗑️ Deleted {asin} due to 404", "info")
             else:
                 logger.warning(f"[{task_id}] DELETE FAILED {asin}: {error}")
@@ -564,7 +542,7 @@ async def apply_scraped_to_variants(
 
             base_url = remove_utm_source(url)
             has_different_urls = any(
-                color_url_map.get(c, base_url) != base_url
+                c not in color_url_map or color_url_map[c] != base_url
                 for c in color_groups
             )
 
@@ -575,15 +553,24 @@ async def apply_scraped_to_variants(
                 idx = start_index
 
                 for clabel, cvariants in color_groups.items():
-                    correct_url = color_url_map.get(clabel, url)
+                    if clabel not in color_url_map:
+                        total_updated += await mark_missing_variants(
+                            cvariants, patch_product_to_api, task_id, _queue_search_update)
+                        idx += len(cvariants)
+                        continue
+                    correct_url = color_url_map[clabel]
                     clean_url = remove_utm_source(correct_url)
 
                     if clean_url not in scraped_cache:
                         append_log(task_id, f"[{idx}] Scraping color URL: {correct_url}", "debug")
                         cs = await scrape_product_data(correct_url, client=client)
-                        scraped_cache[clean_url] = cs if (cs and not cs.get("rnet_status_404")) else None
+                        scraped_cache[clean_url] = cs
 
-                    cdata = scraped_cache.get(clean_url) or scraped_data
+                    cdata = scraped_cache.get(clean_url)
+                    if not cdata:
+                        logger.warning("[%s] colour fetch failed; keeping previous data: %s", task_id, clean_url)
+                        idx += len(cvariants)
+                        continue
                     # Strip color_links to prevent re-splitting on recursive call
                     cdata_single = {k: v for k, v in cdata.items() if k != "color_links"}
 
@@ -644,7 +631,7 @@ async def apply_scraped_to_variants(
 
         if stock_status == "low_stock":
             availability_status = "Low Stock"
-        elif stock_status == "out_of_stock" or stock_quantity <= 0:
+        elif stock_status == "out_of_stock":
             availability_status = "Out of Stock"
         else:
             availability_status = "In Stock"
@@ -656,9 +643,6 @@ async def apply_scraped_to_variants(
             append_log(task_id, f"[{idx}] ⏭️  {asin} | {variant_color}/{variant_size} | No changes, skipped", "debug")
             continue
 
-        parent_asin = _derive_parent_asin(asin)
-        if parent_asin:
-            _PARENT_ASINS_TO_EMBED.add(parent_asin)
         old_hanoot = float(variant.get("price", {}).get("hanooot_price", 0) or 0)
         new_hanoot = float(price_block.get("hanooot_price", 0) or 0)
         if old_hanoot != new_hanoot:
@@ -697,6 +681,7 @@ async def apply_scraped_to_variants(
 
         if success:
             updated_count += 1
+            _queue_search_update(_derive_parent_asin(asin))
             logger.info(f"[{task_id}] UPDATED {asin}")
             append_log(task_id, f"[{idx}] ✅ {asin} | {variant_color}/{variant_size} | Stock: {stock_quantity} ({availability_status})", "info")
         else:
@@ -1100,6 +1085,12 @@ async def update_primark_prices_pipeline(
     variants_completed_ref: List[int] = [0]
     scrape_failed_ref: List[int] = [0]
 
+    # Search-index sync: started just before the workers that feed it; it first
+    # replays anything a previous run could not deliver.
+    product_sync = BulkProductSync(source="primark", task_id=task_id)
+    await product_sync.start()
+    sync_token = _PRODUCT_SYNC.set(product_sync)   # inherited by the tasks created below
+
     fetcher_task = asyncio.create_task(
         _fetcher_into_queue(
             scrape_queue, task_id, filter_task_id, filter_sku, batch_size, concurrency,
@@ -1121,11 +1112,35 @@ async def update_primark_prices_pipeline(
         for _ in range(concurrency)
     ]
 
-    await fetcher_task
-    await asyncio.gather(*scraper_tasks)
-    for _ in range(concurrency):
-        await patch_queue.put(None)
-    await asyncio.gather(*patcher_tasks)
+    try:
+        await fetcher_task
+        await asyncio.gather(*scraper_tasks)
+        for _ in range(concurrency):
+            await patch_queue.put(None)
+        await asyncio.gather(*patcher_tasks)
+    except BaseException:
+        # Cancelled or crashed mid-run: stop the workers first (a cancelled run must not
+        # keep patching in the background), then save every queued / in-flight search
+        # update to Redis so the next run sends it first. Nothing is dropped.
+        workers = [fetcher_task, *scraper_tasks, *patcher_tasks]
+        for t in workers:
+            t.cancel()
+        await asyncio.wait(workers, timeout=30)
+        await product_sync.abort()
+        raise
+    finally:
+        _PRODUCT_SYNC.reset(sync_token)
+
+    # Final flush + confirmation of this run's search-index updates. Anything that
+    # cannot be delivered or confirmed is spooled to Redis and sent first next run.
+    sync_stats = await product_sync.close()
+    logger.info(f"[{task_id}] Search index sync: {sync_stats}")
+    append_log(
+        task_id,
+        f"Search index sync: {sync_stats['asins_sent']} sent in {sync_stats['batches_sent']} batches, "
+        f"{sync_stats['asins_confirmed']} confirmed, {sync_stats['asins_spooled']} spooled for next run"
+        + (f", {sync_stats['replayed']} replayed from an earlier run" if sync_stats["replayed"] else ""), "info",
+    )
 
     total_updated, total_skipped = counts[0], counts[1]
     completed = variants_completed_ref[0]

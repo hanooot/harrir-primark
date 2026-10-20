@@ -1,3 +1,4 @@
+from app.core.inventory import source_quantity
 import asyncio
 import json
 import logging
@@ -7,6 +8,8 @@ import time
 import requests
 from typing import Optional
 from urllib.parse import quote
+
+from app.core.filter_apply import split_filters
 from datetime import datetime, timezone
 
 from arq import create_pool
@@ -240,8 +243,13 @@ else:
 #  API CALLS
 # ============================================================
 
-def build_algolia_params(page=0, hits_per_page=36):
-    """Build the Algolia params string for the category listing query."""
+def build_algolia_params(page=0, hits_per_page=36, selection=None):
+    """Build the Algolia params string for the category listing query.
+
+    `selection` (a FilterSelection) adds `facetFilters`/`numericFilters`. The
+    mesh forwards this string straight to the search index, so a filtered
+    listing is the same single request an unfiltered one is.
+    """
     attributes = [
         'url.en', 'attr_product_collection.en', 'attr_collection_1.en',
         'media', 'title.en', 'article_swatches.en', 'promotions.en',
@@ -262,21 +270,32 @@ def build_algolia_params(page=0, hits_per_page=36):
         f"&optionalFilters=null"
         f"&page={page}"
     )
+    if selection:
+        facet = selection.algolia_facet_filters()
+        numeric = selection.algolia_numeric_filters()
+        if facet:
+            params += "&facetFilters=" + json.dumps(facet, ensure_ascii=False)
+        if numeric:
+            params += "&numericFilters=" + json.dumps(numeric, ensure_ascii=False)
     return params
 
 
-def fetch_category_url_keys(category_slug, hits_per_page=36, max_pages=None):
+def fetch_category_url_keys(category_slug, hits_per_page=36, max_pages=None, selection=None):
     """
     Fetch all product URL keys from a Primark category page using
     the Algolia-backed getProductListingWithCategory query.
     Returns a deduplicated list of url_key strings.
+
+    `selection` narrows the listing at the source, so a filtered job only ever
+    sees the products it asked for.
     """
     all_url_keys = []
     seen_style_codes = set()
     page = 0
 
     while True:
-        params_str = build_algolia_params(page=page, hits_per_page=hits_per_page)
+        params_str = build_algolia_params(page=page, hits_per_page=hits_per_page,
+                                          selection=selection)
         variables = {
             "indexName1": ALGOLIA_INDEX,
             "params1": params_str,
@@ -507,10 +526,10 @@ def build_variant_v2(parent_product, variant_item, variant_index, url_key, color
     v["brand_id"] = {"en": en_brand, "ar": brand_ar}
     v["link"] = f"https://www.primark.ae/en-ae/p/{url_key}"
 
-    v["stock"] = {"quantity": 1 if in_stock else 0}
+    v["stock"] = {"quantity": source_quantity(product.get("stock_quantity"), "Primark variant stock_quantity") if in_stock else 0}
     v["availability"] = {
         "status": "In Stock" if in_stock else "Out of Stock",
-        "quantity": 1 if in_stock else 0,
+        "quantity": source_quantity(product.get("stock_quantity"), "Primark variant stock_quantity") if in_stock else 0,
         "delivery_dates": [],
     }
 
@@ -841,16 +860,24 @@ def run_scraper(
         # Parse target URL
         # e.g., https://www.primark.ae/en/shop-women/clothing/jeans
         # e.g., https://www.primark.ae/en/buy-cotton-denim-high-waisted-tapered-jeans-light-blue
+        #
+        # `hx_filters` comes off FIRST. Everything below splits the URL as a raw
+        # string, so a query string left on the end would be swallowed into the
+        # slug and the category would silently resolve to nothing.
+        clean_url, selection = split_filters(target_url)
+        if selection:
+            append_log(task_id, f"Filters applied at source: {selection.describe()}", "info")
         url_keys = []
-        parsed_url = target_url.strip().rstrip("/")
+        parsed_url = clean_url.strip().rstrip("/")
         slug = parsed_url.split("/")[-1]
 
-        if "shop-" in target_url:
+        if "shop-" in clean_url:
             # It's a category
-            append_log(task_id, f"Discovering products in category: '{target_url}'", "info")
+            append_log(task_id, f"Discovering products in category: '{clean_url}'", "info")
             # Extract full category slug like 'shop-women/clothing/jeans'
             category_slug = parsed_url.split("/en/")[-1] if "/en/" in parsed_url else slug
-            url_keys = fetch_category_url_keys(category_slug, hits_per_page=HITS_PER_PAGE)
+            url_keys = fetch_category_url_keys(category_slug, hits_per_page=HITS_PER_PAGE,
+                                               selection=selection)
         else:
             # Single product
             append_log(task_id, f"Scraping single product: '{slug}'", "info")

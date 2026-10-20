@@ -88,6 +88,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 SOURCE = "PRIMARK"
 COLLECTION = (os.getenv("MONGO_HOME_COLLECTION") or "source_home").strip()
+
+# Retention for `source_home`: captures older than this are expired by Mongo
+# itself (see `_ensure_ttl_index`). Raise it if a report ever needs a longer
+# look-back than a fortnight.
+_HOME_TTL_DAYS = int((os.getenv("HOME_TTL_DAYS") or "14").strip() or "14")
+_TTL_INDEX_NAME = "captured_at_ttl"
+
 _BANDWIDTH_KIND = "home"
 
 _LANG = (os.getenv("PRIMARK_HOME_LANG") or "en").strip("/")
@@ -486,6 +493,7 @@ async def capture_home_banners(task_id: Optional[str] = None, *,
     if store:
         async with _write_collection() as col:
             await col.create_index([("source", 1), ("doc_type", 1), ("captured_at", -1)])
+            await _ensure_ttl_index(col)
             await col.insert_one(dict(doc))
         logger.info("[home] Stored 1 banners row in '%s'", COLLECTION)
 
@@ -515,6 +523,32 @@ def _mongo_uri() -> str:
     if not uri:
         raise EnvironmentError("No Mongo URI (MONGO_URI_PROD / MONGO_URI) — cannot store the banner row.")
     return uri
+
+
+async def _ensure_ttl_index(col) -> None:
+    """Keep only the last `HOME_TTL_DAYS` of captures; Mongo deletes the rest.
+
+    Each capture appends a document and nothing ever removed them, so this
+    collection only grew — the banner arrays make the average document ~100 KB,
+    so it adds up far faster than the document count suggests. A TTL index on
+    `captured_at` (a real BSON Date on every row) lets Mongo expire old captures
+    on its own, with no cron and nothing to remember to run.
+
+    Created here rather than in a migration so it is self-healing: if the index
+    is ever dropped, the next capture puts it back.
+
+    Failures are logged and swallowed on purpose. If someone widens the window
+    later with `collMod`, this call would otherwise raise IndexOptionsConflict
+    and take the whole nightly capture down with it — retention is not worth
+    losing the capture over.
+    """
+    try:
+        await col.create_index([("captured_at", 1)],
+                               name=_TTL_INDEX_NAME,
+                               expireAfterSeconds=_HOME_TTL_DAYS * 86400)
+    except Exception as e:  # pragma: no cover - never fail a capture over retention
+        logger.warning("[home] TTL index not applied to '%s' (%s: %s); "
+                       "captures are unaffected", COLLECTION, type(e).__name__, e)
 
 
 @asynccontextmanager

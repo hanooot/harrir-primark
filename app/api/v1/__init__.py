@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from .home_scraper import router as home_router
 from .primark_scraper import router as primark_router
 from .price_updater import router as price_updater_router
+from .filters_scraper import router as filters_router
 
 api_router = APIRouter()
 api_router.include_router(
@@ -14,6 +15,7 @@ api_router.include_router(
     price_updater_router,
 )
 api_router.include_router(home_router)
+api_router.include_router(filters_router)
 
 # The cross-source hub (`/api/v1/home/*`) lives in harrir_core so every service
 # answers the same registry, latest and report paths. Older images do not carry
